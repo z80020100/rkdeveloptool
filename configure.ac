@@ -4,7 +4,7 @@ AC_INIT([Rockchip rkdeveloptool], 1.32, [Eddie Cai <eddie.cai.linux@gmail.com>],
 AC_PREREQ([2.68])
 AC_CONFIG_SRCDIR(main.cpp)
 AC_CONFIG_AUX_DIR(cfg)
-AM_INIT_AUTOMAKE([foreign no-dist-gzip dist-bzip2 1.9])
+AM_INIT_AUTOMAKE([foreign no-dist-gzip dist-bzip2 1.9 subdir-objects])
 AM_CONFIG_HEADER(cfg/config.h)
 
 SUBDIRS=""
@@ -32,6 +32,7 @@ esac
 
 
 PKG_CHECK_MODULES(LIBUSB1,libusb-1.0)
+PKG_CHECK_MODULES(OPENSSL_CRYPTO, libcrypto)
 
 AC_CONFIG_FILES([Makefile])
 
