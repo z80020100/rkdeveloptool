@@ -1,0 +1,3 @@
+[submodule "rockchip-tool"]
+	path = rockchip-tool
+	url = https://github.com/z80020100/rockchip-tool.git
