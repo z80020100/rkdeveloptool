@@ -1,10 +1,14 @@
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RKDEV="$SCRIPT_DIR/rkdeveloptool"
 IMG_UNPACK="$SCRIPT_DIR/img_unpack"
 AFPTOOL="$SCRIPT_DIR/afptool"
+LOG_DIR="${TMPDIR:-/tmp}"
+LOG_DIR="${LOG_DIR%/}"
+WAIT_ROCKUSB_SECS="${WAIT_ROCKUSB_SECS:-30}"
+WAIT_MASKROM_SECS="${WAIT_MASKROM_SECS:-15}"
 
 TARGET=""
 
@@ -21,8 +25,18 @@ Usage: $(basename "$0") <path>
   writes a fresh loader first so that gpt writes are accepted (a stock
   RK356x Loader rejects gpt).
 
+All currently connected Rockchip devices are flashed in parallel. ADB-mode
+devices are rebooted to Loader via 'adb -t <transport_id> reboot loader'.
+Per-device logs are written to \$TMPDIR/flash-<locationID>.log.
+
 Options:
   -h, --help   Show this help
+
+Environment:
+  WAIT_ROCKUSB_SECS   Seconds to wait for ADB-mode devices to enter rockusb
+                      (default: 30)
+  WAIT_MASKROM_SECS   Seconds to wait per device for Loader -> Maskrom
+                      (default: 15)
 EOF
 }
 
@@ -76,7 +90,6 @@ elif [ -f "$TARGET" ]; then
 
     TMP_DIR=$(mktemp -d)
     echo "Unpacking $TARGET ..."
-    # Strip blank lines from each tool's stderr while keeping version banners and error text
     "$IMG_UNPACK" "$TARGET" "$TMP_DIR/loader.bin" "$TMP_DIR/rkfw.img" 2>&1 >/dev/null |
         sed '/^$/d' >&2
     "$AFPTOOL" -unpack "$TMP_DIR/rkfw.img" "$TMP_DIR/unpacked" 2>&1 >/dev/null |
@@ -116,88 +129,6 @@ if [ -z "$PARTITIONS" ]; then
     exit 1
 fi
 
-detect_device() {
-    local output
-    for i in 1 2 3; do
-        output=$("$RKDEV" ld 2>&1) || true
-        case "$output" in
-        *Maskrom*)
-            echo "maskrom"
-            return
-            ;;
-        *Loader*)
-            echo "loader"
-            return
-            ;;
-        esac
-        [ "$i" -lt 3 ] && sleep 3
-    done
-    return 1
-}
-
-run_rkdev() {
-    local rc=0
-    "$RKDEV" "$@" || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        echo "  -> rkdeveloptool $* failed (exit code $rc)" >&2
-        return "$rc"
-    fi
-}
-
-echo "Detecting device ..."
-
-# Try rockusb first; fall back to ADB reboot if no rockusb device found
-DEV_MODE=$(detect_device) || {
-    if command -v adb >/dev/null 2>&1 && adb devices 2>/dev/null | grep -q 'device$'; then
-        echo "Device found in ADB mode and rebooting to loader ..."
-        adb reboot loader
-        sleep 5
-    fi
-    DEV_MODE=$(detect_device) || {
-        echo "Error: No Rockchip device found." >&2
-        echo "Please connect the device in Maskrom or Loader mode." >&2
-        exit 1
-    }
-}
-
-# A stock RK356x Loader rejects gpt writes; always route through Maskrom to flash a fresh loader first
-if [ "$DEV_MODE" = "loader" ]; then
-    echo "Loader mode detected and switching to Maskrom for a clean loader flash ..."
-    "$RKDEV" rd 3 >/dev/null 2>&1 || true
-    sleep 5
-    DEV_MODE=$(detect_device) || true
-    if [ "$DEV_MODE" != "maskrom" ]; then
-        echo "Error: Failed to switch to Maskrom mode." >&2
-        exit 1
-    fi
-fi
-
-echo "========================================="
-echo " Rockchip Flash Script (rkdeveloptool)"
-echo "========================================="
-echo
-echo "Source:          $TARGET ($MODE mode)"
-echo "Image directory: $IMG_DIR"
-echo "Parameter file:  $PARAM_FILE"
-echo
-
-echo "[Step 1] Downloading loader to RAM ..."
-run_rkdev db "$IMG_DIR/MiniLoaderAll.bin"
-echo "Loader downloaded and waiting for device ..."
-sleep 3
-
-echo "[Step 2] Writing loader to flash ..."
-run_rkdev ul "$IMG_DIR/MiniLoaderAll.bin"
-echo "Loader written to flash."
-echo
-
-echo "[Step 3] Writing partition table ..."
-run_rkdev gpt "$PARAM_FILE"
-echo "Partition table written."
-echo
-
-echo "[Step 4] Writing partition images ..."
-
 MATCHED=()
 SKIPPED=()
 while IFS= read -r part; do
@@ -207,30 +138,201 @@ while IFS= read -r part; do
         SKIPPED+=("$part")
     fi
 done <<<"$PARTITIONS"
-echo "  Flash: ${MATCHED[*]:-(none)}"
-echo "  Skip:  ${SKIPPED[*]:-(none)}"
+
+# Emit "locationID mode" pairs, one per line, for each currently visible rockusb device.
+list_rockusb_devices() {
+    "$RKDEV" ld 2>/dev/null | tr -d '\r' |
+        awk -F'\t' '/LocationID=/ {
+            split($2, vp, ",")
+            split(vp[3], lid, "=")
+            print lid[2] " " $3
+        }'
+}
+
+list_rockusb_locations() {
+    list_rockusb_devices | awk '{print $1}'
+}
+
+mode_of_location() {
+    list_rockusb_devices | awk -v L="$1" '$1 == L {print $2; exit}'
+}
+
+list_adb_transports() {
+    command -v adb >/dev/null 2>&1 || return 0
+    adb devices -l 2>/dev/null | awk '
+        $2 == "device" {
+            for (i = 3; i <= NF; i++) {
+                if ($i ~ /^transport_id:/) {
+                    split($i, a, ":")
+                    print a[2]
+                }
+            }
+        }'
+}
+
+echo "Detecting devices ..."
+INITIAL_COUNT=$(list_rockusb_locations | grep -c '^' || true)
+
+ADB_TIDS=$(list_adb_transports)
+ADB_COUNT=$(printf '%s' "$ADB_TIDS" | grep -c '^' || true)
+
+EXPECTED=$((INITIAL_COUNT + ADB_COUNT))
+if [ "$EXPECTED" -eq 0 ]; then
+    echo "Error: No Rockchip devices (rockusb or ADB) found." >&2
+    exit 1
+fi
+echo "  rockusb: $INITIAL_COUNT, adb: $ADB_COUNT (expected total: $EXPECTED)"
+
+if [ "$ADB_COUNT" -gt 0 ]; then
+    echo "Rebooting ADB-mode devices to Loader ..."
+    while IFS= read -r tid; do
+        [ -z "$tid" ] && continue
+        echo "  adb -t $tid reboot loader"
+        adb -t "$tid" reboot loader >/dev/null 2>&1 || true
+    done <<<"$ADB_TIDS"
+
+    echo "Waiting up to ${WAIT_ROCKUSB_SECS}s for $EXPECTED rockusb device(s) ..."
+    for i in $(seq "$WAIT_ROCKUSB_SECS"); do
+        CURRENT=$(list_rockusb_locations | grep -c '^' || true)
+        if [ "$CURRENT" -ge "$EXPECTED" ]; then
+            break
+        fi
+        sleep 1
+    done
+fi
+
+LOCATIONS=$(list_rockusb_locations)
+LOC_COUNT=$(printf '%s' "$LOCATIONS" | grep -c '^' || true)
+if [ "$LOC_COUNT" -lt 1 ]; then
+    echo "Error: No rockusb devices ready after ${WAIT_ROCKUSB_SECS}s." >&2
+    exit 1
+fi
+LOST=$((EXPECTED - LOC_COUNT))
+if [ "$LOST" -gt 0 ]; then
+    echo "Warning: $LOST device(s) did not enter rockusb within ${WAIT_ROCKUSB_SECS}s and will be skipped." >&2
+fi
+
+echo
+echo "========================================="
+echo " Rockchip Flash Script (parallel)"
+echo "========================================="
+echo "Source:          $TARGET ($MODE mode)"
+echo "Image directory: $IMG_DIR"
+echo "Parameter file:  $PARAM_FILE"
+echo "Devices ($LOC_COUNT):"
+list_rockusb_devices | awk '{printf "  loc=%-8s mode=%s\n", $1, $2}'
+echo "Flash partitions: ${MATCHED[*]:-(none)}"
+echo "Skip partitions:  ${SKIPPED[*]:-(none)}"
+echo "Per-device log:   $LOG_DIR/flash-<loc>.log"
 echo
 
-if [ ${#MATCHED[@]} -eq 0 ]; then
-    echo "Warning: No partition images matched and only GPT was written."
-    echo "Expected files like: uboot.img, boot.img, recovery.img, etc."
-    echo "========================================="
-    echo " No partitions were flashed (GPT updated)."
-    echo "========================================="
-else
-    # wlx resolves partition offset from device GPT by name
-    for part in "${MATCHED[@]}"; do
-        echo "Writing $part.img ..."
-        run_rkdev wlx "$part" "$IMG_DIR/$part.img"
-    done
-    echo "========================================="
-    echo " All done! Flashed ${#MATCHED[@]} partition(s)."
-    echo "========================================="
-fi
+# Burn one device end-to-end, identified by its USB locationID.
+# Exits non-zero on any hard failure so the parent's wait() can tag it FAIL.
+flash_one() {
+    local loc="$1"
+    local log="$LOG_DIR/flash-${loc}.log"
+
+    run_step() {
+        if ! "$RKDEV" -l "$loc" "$@"; then
+            echo "[loc=$loc] FAIL: $1"
+            exit 1
+        fi
+    }
+
+    {
+        echo "[loc=$loc] Start at $(date '+%Y-%m-%d %H:%M:%S')"
+
+        local mode
+        mode=$(mode_of_location "$loc" || true)
+        echo "[loc=$loc] Initial mode: ${mode:-unknown}"
+
+        if [ "$mode" = "Loader" ]; then
+            echo "[loc=$loc] Switching Loader -> Maskrom (rd 3)"
+            "$RKDEV" -l "$loc" rd 3 >/dev/null 2>&1 || true
+            local j
+            for j in $(seq "$WAIT_MASKROM_SECS"); do
+                sleep 1
+                mode=$(mode_of_location "$loc" || true)
+                if [ "$mode" = "Maskrom" ]; then
+                    break
+                fi
+            done
+            if [ "$mode" != "Maskrom" ]; then
+                echo "[loc=$loc] FAIL: did not reach Maskrom (current=${mode:-gone})"
+                exit 1
+            fi
+        elif [ "$mode" != "Maskrom" ]; then
+            echo "[loc=$loc] FAIL: unexpected mode '${mode:-gone}'"
+            exit 1
+        fi
+
+        echo "[loc=$loc] Step 1: Download loader to RAM (db)"
+        run_step db "$IMG_DIR/MiniLoaderAll.bin"
+        sleep 3  # let the in-RAM loader re-enumerate on USB before subsequent steps
+
+        echo "[loc=$loc] Step 2: Write loader to flash (ul)"
+        run_step ul "$IMG_DIR/MiniLoaderAll.bin"
+
+        echo "[loc=$loc] Step 3: Write partition table (gpt)"
+        run_step gpt "$PARAM_FILE"
+
+        echo "[loc=$loc] Step 4: Write ${#MATCHED[@]} partition image(s)"
+        local part
+        for part in "${MATCHED[@]}"; do
+            echo "[loc=$loc] Writing $part.img"
+            if ! "$RKDEV" -l "$loc" wlx "$part" "$IMG_DIR/$part.img"; then
+                echo "[loc=$loc] FAIL: wlx $part"
+                exit 1
+            fi
+        done
+
+        echo "[loc=$loc] Step 5: Reboot (rd)"
+        "$RKDEV" -l "$loc" rd >/dev/null 2>&1 || true
+        echo "[loc=$loc] OK at $(date '+%Y-%m-%d %H:%M:%S')"
+    } >"$log" 2>&1
+}
+
+PIDS=()
+LOCS=()
+for loc in $LOCATIONS; do
+    : >"$LOG_DIR/flash-${loc}.log"
+    flash_one "$loc" &
+    PIDS+=("$!")
+    LOCS+=("$loc")
+done
+
+echo "Flashing $LOC_COUNT device(s) in parallel (tail -f $LOG_DIR/flash-*.log to follow) ..."
 echo
-echo "[Step 5] Rebooting device ..."
-if run_rkdev rd; then
-    echo "Device is rebooting."
-else
-    echo "Warning: Failed to reboot device. Please reboot manually." >&2
+
+RESULTS=()
+for i in "${!PIDS[@]}"; do
+    if wait "${PIDS[$i]}"; then
+        RESULTS+=("OK")
+    else
+        RESULTS+=("FAIL")
+    fi
+done
+
+echo "========================================="
+echo " Flash report"
+echo "========================================="
+OK_COUNT=0
+FAIL_COUNT=0
+for i in "${!LOCS[@]}"; do
+    loc="${LOCS[$i]}"
+    res="${RESULTS[$i]}"
+    log="$LOG_DIR/flash-${loc}.log"
+    printf "  loc=%-8s %-4s  log=%s\n" "$loc" "$res" "$log"
+    if [ "$res" = "OK" ]; then
+        OK_COUNT=$((OK_COUNT + 1))
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+done
+echo "-----------------------------------------"
+echo " Success: $OK_COUNT  Failed: $FAIL_COUNT"
+echo "========================================="
+
+if [ "$FAIL_COUNT" -gt 0 ]; then
+    exit 1
 fi
