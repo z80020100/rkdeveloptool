@@ -44,6 +44,7 @@ void usage()
 	printf("\r\n---------------------Tool Usage ---------------------\r\n");
 	printf("Help:\t\t\t-h or --help\r\n");
 	printf("Version:\t\t-v or --version\r\n");
+	printf("SelectDevice:\t\t-l <hex_locationID> (precede the command; required when multiple devices are attached)\r\n");
 	printf("ListDevice:\t\tld\r\n");
 	printf("DownloadBoot:\t\tdb <Loader>\r\n");
 	printf("UpgradeLoader:\t\tul <Loader>\r\n");
@@ -3092,7 +3093,7 @@ void list_device(CRKScan *pScan)
 }
 
 
-bool handle_command(int argc, char* argv[], CRKScan *pScan)
+bool handle_command(int argc, char* argv[], CRKScan *pScan, UINT uiSelectedLocationID)
 {
 	string strCmd;
 	strCmd = argv[1];
@@ -3146,15 +3147,26 @@ bool handle_command(int argc, char* argv[], CRKScan *pScan)
 		NORMAL_COLOR_ATTR;
 		printf("\r\n");
 		return bSuccess;
-	} else if (cnt > 1) {
+	} else if (cnt > 1 && uiSelectedLocationID == 0) {
 		ERROR_COLOR_ATTR;
-		printf("Found too many rockusb devices, please plug devices out!");
+		printf("Found too many rockusb devices, please specify one with -l <hex_locationID> or unplug the others!");
 		NORMAL_COLOR_ATTR;
 		printf("\r\n");
 		return bSuccess;
 	}
 
-	bRet = pScan->GetDevice(dev, 0);
+	int iDevPos = 0;
+	if (uiSelectedLocationID != 0) {
+		iDevPos = pScan->GetPos(uiSelectedLocationID);
+		if (iDevPos < 0) {
+			ERROR_COLOR_ATTR;
+			printf("Device with locationID 0x%x not found!", uiSelectedLocationID);
+			NORMAL_COLOR_ATTR;
+			printf("\r\n");
+			return bSuccess;
+		}
+	}
+	bRet = pScan->GetDevice(dev, iDevPos);
 	if (!bRet) {
 		ERROR_COLOR_ATTR;
 		printf("Getting information about rockusb device failed!");
@@ -3361,8 +3373,20 @@ int main(int argc, char* argv[])
 	char szProgramDir[256];
 	string strLogDir,strConfigFile;
 	struct stat statBuf;
+	UINT uiSelectedLocationID = 0;
 
 	g_ConfigItemVec.clear();
+
+	if (argc >= 3 && strcmp(argv[1], "-l") == 0) {
+		char *pszEnd;
+		uiSelectedLocationID = strtoul(argv[2], &pszEnd, 16);
+		if (*pszEnd || uiSelectedLocationID == 0) {
+			fprintf(stderr, "Error: invalid locationID, expect hex such as 103 or 0x103\r\n");
+			return -1;
+		}
+		argc -= 2;
+		argv += 2;
+	}
 
 #ifndef __MINGW32__
 	snprintf(szProgramProcPath, sizeof(szProgramProcPath), "/proc/%d/exe", getpid());
@@ -3421,7 +3445,7 @@ int main(int argc, char* argv[])
 
 	if (argc == 1)
 		usage();
-	else if (!handle_command(argc, argv, pScan))
+	else if (!handle_command(argc, argv, pScan, uiSelectedLocationID))
 			return -0xFF;
 	if (pScan)
 		delete pScan;
