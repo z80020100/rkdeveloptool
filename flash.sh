@@ -9,6 +9,7 @@ LOG_DIR="${TMPDIR:-/tmp}"
 LOG_DIR="${LOG_DIR%/}"
 WAIT_ROCKUSB_SECS="${WAIT_ROCKUSB_SECS:-30}"
 WAIT_MASKROM_SECS="${WAIT_MASKROM_SECS:-15}"
+REFRESH_INTERVAL="${REFRESH_INTERVAL:-1}"
 
 TARGET=""
 
@@ -27,7 +28,8 @@ Usage: $(basename "$0") <path>
 
 All currently connected Rockchip devices are flashed in parallel. ADB-mode
 devices are rebooted to Loader via 'adb -t <transport_id> reboot loader'.
-Per-device logs are written to \$TMPDIR/flash-<locationID>.log.
+Per-device output is prefixed with [loc=X] and streamed to the terminal
+as well as \$TMPDIR/flash-<locationID>.log.
 
 Options:
   -h, --help   Show this help
@@ -77,7 +79,14 @@ fi
 require_tool rkdeveloptool "$RKDEV"
 
 TMP_DIR=""
-cleanup() { [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"; }
+STATUS_FLAG=""
+COORD_PID=""
+cleanup() {
+    [ -n "$COORD_PID" ] && kill "$COORD_PID" 2>/dev/null
+    [ -n "$STATUS_FLAG" ] && rm -f "$STATUS_FLAG"
+    [ -n "$LOG_DIR" ] && rm -f "$LOG_DIR"/flash-*.status 2>/dev/null
+    [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"
+}
 trap cleanup EXIT
 
 if [ -d "$TARGET" ]; then
@@ -228,26 +237,34 @@ echo
 
 # Burn one device end-to-end, identified by its USB locationID.
 # Exits non-zero on any hard failure so the parent's wait() can tag it FAIL.
+# Full output goes to $LOG_DIR/flash-<loc>.log; a one-line status file at
+# $LOG_DIR/flash-<loc>.status is what the coordinator paints on screen.
 flash_one() {
     local loc="$1"
     local log="$LOG_DIR/flash-${loc}.log"
+    local status_file="$LOG_DIR/flash-${loc}.status"
+
+    set_status() { printf '%s' "$*" >"$status_file"; }
 
     run_step() {
         if ! "$RKDEV" -l "$loc" "$@"; then
-            echo "[loc=$loc] FAIL: $1"
+            set_status "FAIL: $1"
+            echo "FAIL: $1"
             exit 1
         fi
     }
 
     {
-        echo "[loc=$loc] Start at $(date '+%Y-%m-%d %H:%M:%S')"
+        set_status "starting"
+        echo "Start at $(date '+%Y-%m-%d %H:%M:%S')"
 
         local mode
         mode=$(mode_of_location "$loc" || true)
-        echo "[loc=$loc] Initial mode: ${mode:-unknown}"
+        echo "Initial mode: ${mode:-unknown}"
 
         if [ "$mode" = "Loader" ]; then
-            echo "[loc=$loc] Switching Loader -> Maskrom (rd 3)"
+            set_status "Loader -> Maskrom (rd 3)"
+            echo "Switching Loader -> Maskrom (rd 3)"
             "$RKDEV" -l "$loc" rd 3 >/dev/null 2>&1 || true
             local j
             for j in $(seq "$WAIT_MASKROM_SECS"); do
@@ -258,38 +275,101 @@ flash_one() {
                 fi
             done
             if [ "$mode" != "Maskrom" ]; then
-                echo "[loc=$loc] FAIL: did not reach Maskrom (current=${mode:-gone})"
+                set_status "FAIL: did not reach Maskrom"
+                echo "FAIL: did not reach Maskrom (current=${mode:-gone})"
                 exit 1
             fi
         elif [ "$mode" != "Maskrom" ]; then
-            echo "[loc=$loc] FAIL: unexpected mode '${mode:-gone}'"
+            set_status "FAIL: unexpected mode '${mode:-gone}'"
+            echo "FAIL: unexpected mode '${mode:-gone}'"
             exit 1
         fi
 
-        echo "[loc=$loc] Step 1: Download loader to RAM (db)"
+        set_status "Step 1/5: db (download loader)"
+        echo "Step 1: Download loader to RAM (db)"
         run_step db "$IMG_DIR/MiniLoaderAll.bin"
         sleep 3  # let the in-RAM loader re-enumerate on USB before subsequent steps
 
-        echo "[loc=$loc] Step 2: Write loader to flash (ul)"
+        set_status "Step 2/5: ul (write loader)"
+        echo "Step 2: Write loader to flash (ul)"
         run_step ul "$IMG_DIR/MiniLoaderAll.bin"
 
-        echo "[loc=$loc] Step 3: Write partition table (gpt)"
+        set_status "Step 3/5: gpt (partition table)"
+        echo "Step 3: Write partition table (gpt)"
         run_step gpt "$PARAM_FILE"
 
-        echo "[loc=$loc] Step 4: Write ${#MATCHED[@]} partition image(s)"
+        echo "Step 4: Write ${#MATCHED[@]} partition image(s)"
         local part
         for part in "${MATCHED[@]}"; do
-            echo "[loc=$loc] Writing $part.img"
+            set_status "Step 4/5: wlx $part"
+            echo "Writing $part.img"
             if ! "$RKDEV" -l "$loc" wlx "$part" "$IMG_DIR/$part.img"; then
-                echo "[loc=$loc] FAIL: wlx $part"
+                set_status "FAIL: wlx $part"
+                echo "FAIL: wlx $part"
                 exit 1
             fi
         done
 
-        echo "[loc=$loc] Step 5: Reboot (rd)"
+        set_status "Step 5/5: rd (reboot)"
+        echo "Step 5: Reboot (rd)"
         "$RKDEV" -l "$loc" rd >/dev/null 2>&1 || true
-        echo "[loc=$loc] OK at $(date '+%Y-%m-%d %H:%M:%S')"
+        set_status "OK"
+        echo "OK at $(date '+%Y-%m-%d %H:%M:%S')"
     } >"$log" 2>&1
+}
+
+# Strip rkdeveloptool's in-place ANSI repaint and CRs from a log tail and
+# return the most recent progress line: "(NN%)" for wlx and "current XK" for
+# db / ul / erase variants.
+log_tail_progress() {
+    local log_file="$1"
+    [ -r "$log_file" ] || return 0
+    tail -c 4096 "$log_file" 2>/dev/null |
+        tr -d '\r\033' |
+        sed -E 's/\[[0-9;]*[A-Za-z]//g' |
+        awk '/\([0-9]+%\)|current [0-9]+K/ { last = $0 } END { if (last) print last }'
+}
+
+# Repaint LOC_COUNT fixed terminal lines in place by reading each device's
+# one-line status file. mtime gives elapsed-in-step so long writes (super.img)
+# never look stuck. Appends the latest "current/total" line from the log so
+# byte-level progress shows alongside the step name.
+coordinator_loop() {
+    local cols
+    cols=$(tput cols 2>/dev/null || echo 120)
+    local esc
+    esc=$(printf '\033')
+    local first=1
+    while [ -f "$STATUS_FLAG" ]; do
+        if [ "$first" -eq 0 ]; then
+            printf '%s[%dA' "$esc" "$LOC_COUNT"
+        fi
+        first=0
+        local loc status_file line mtime now elapsed progress prefix width
+        now=$(date +%s)
+        for loc in "${LOCS[@]}"; do
+            status_file="$LOG_DIR/flash-${loc}.status"
+            if [ -r "$status_file" ]; then
+                line=$(cat "$status_file" 2>/dev/null)
+                mtime=$(stat -f %m "$status_file" 2>/dev/null || stat -c %Y "$status_file" 2>/dev/null || echo "$now")
+                elapsed=$((now - mtime))
+                progress=$(log_tail_progress "$LOG_DIR/flash-${loc}.log")
+                if [ -n "$progress" ] && [ "$line" != "OK" ] && [ "${line#FAIL}" = "$line" ]; then
+                    line="$line | $progress"
+                fi
+                if [ "$elapsed" -ge 2 ] && [ "$line" != "OK" ] && [ "${line#FAIL}" = "$line" ]; then
+                    line="$line (${elapsed}s)"
+                fi
+            else
+                line="(waiting)"
+            fi
+            prefix="[loc=$loc] "
+            width=$((cols - ${#prefix} - 1))
+            [ "$width" -lt 10 ] && width=10
+            printf '\r%s[2K%s%.*s\n' "$esc" "$prefix" "$width" "$line"
+        done
+        sleep "$REFRESH_INTERVAL"
+    done
 }
 
 PIDS=()
@@ -301,8 +381,16 @@ for loc in $LOCATIONS; do
     LOCS+=("$loc")
 done
 
-echo "Flashing $LOC_COUNT device(s) in parallel (tail -f $LOG_DIR/flash-*.log to follow) ..."
-echo
+echo "Flashing $LOC_COUNT device(s) in parallel (logs: $LOG_DIR/flash-*.log) ..."
+
+USE_COORDINATOR=0
+if [ -t 1 ]; then
+    USE_COORDINATOR=1
+    STATUS_FLAG=$(mktemp)
+    for ((__i = 0; __i < LOC_COUNT; __i++)); do echo; done
+    coordinator_loop &
+    COORD_PID=$!
+fi
 
 RESULTS=()
 for i in "${!PIDS[@]}"; do
@@ -312,6 +400,19 @@ for i in "${!PIDS[@]}"; do
         RESULTS+=("FAIL")
     fi
 done
+
+if [ "$USE_COORDINATOR" -eq 1 ]; then
+    rm -f "$STATUS_FLAG"
+    STATUS_FLAG=""
+    wait "$COORD_PID" 2>/dev/null
+    COORD_PID=""
+    ESC=$(printf '\033')
+    printf '%s[%dA' "$ESC" "$LOC_COUNT"
+    for i in "${!LOCS[@]}"; do
+        printf '\r%s[2K[loc=%s] %s\n' "$ESC" "${LOCS[$i]}" "${RESULTS[$i]}"
+    done
+fi
+echo
 
 echo "========================================="
 echo " Flash report"
